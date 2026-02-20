@@ -34,14 +34,15 @@ radii = np.ones(N, dtype=np.float32) * 1.5
 
 alpha_value = 0.0          # The alpha threshold (squared radius for Fixed_alpha_shape_3)
 probe_radius = 1.4         # Used to expand atomic radii (e.g., solvent probe radius)
+filter_type = "singular+regular" 
 
 # Compute the alpha complex
 vertices, faces, tetrahedra = cgal_alpha.compute_alpha_complex_from_atoms(
-    positions, radii, alpha_value, probe_radius
+    positions, radii, alpha_value, probe_radius, filter_type
 )
 
 print(f"Extracted {vertices.shape[0]} vertices")
-print(f"Extracted {faces.shape[0]} boundary triangles")
+print(f"Extracted {faces.shape[0]} faces")
 print(f"Extracted {tetrahedra.shape[0]} interior tetrahedra")
 ```
 

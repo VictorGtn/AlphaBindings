@@ -1,6 +1,6 @@
 # CGAL Alpha Complex Python Bindings
 
-A fast and efficient Python wrapper for computing 3D alpha complexes (volumes and boundary surfaces) from atom positions and radii. This library utilizes the highly optimized `CGAL::Fixed_alpha_shape_3` and is exposed to Python via pybind11.
+A fast and efficient Python wrapper for computing 3D alpha complexes (volumes and boundary surfaces) from atom positions and radii. This library utilizes the highly optimized `CGAL::Fixed_alpha_shape_3` and is exposed to Python via pybind11. Thin necks of the surface, carried by edges that no facet contains, are added as wire triangles so that the components they join stay connected.
 
 ## Dependencies
 
@@ -48,12 +48,29 @@ print(f"Extracted {tetrahedra.shape[0]} interior tetrahedra")
 
 ## Output
 
-- `vertices` (N, 3) float32: one vertex per atom on a face or tetrahedron, then one apex vertex per wire triangle.
-- `faces` (M, 3) int32: the facets whose classification passes `filter`, then the wire triangles.
-- `tetrahedra` (K, 4) int32: the INTERIOR cells, indexing atom vertices.
-- `is_apex` (N,) bool: true for the apex vertices, which are always the last ones.
+`compute_alpha_complex_from_atoms` returns `(vertices, faces, tetrahedra, is_apex)`:
 
-A linking wire is a SINGULAR edge whose two ends lie on faces of two different connected components of the face mesh. Each one becomes the triangle (u, v, apex), with the apex at the neck radius rho over the edge midpoint, rho being the radius of the circle where the two probe-inflated balls (radius r + probe_radius) meet. The apex direction is `normalize(cross(v - u, helper))`, with `helper` the x axis unless `|(v - u).x| >= 0.9 |v - u|`, in which case it is the y axis.
+- `vertices` (N, 3) float32: the atom centres used by a face, a tetrahedron or a wire triangle, followed by one apex vertex per wire triangle.
+- `faces` (M, 3) int32: the facets whose classification passes `filter`, followed by the wire triangles.
+- `tetrahedra` (K, 4) int32: the INTERIOR cells, indexing atom vertices only.
+- `is_apex` (N,) bool: marks the apex vertices, the last `is_apex.sum()` rows of `vertices`.
+
+The surface is not tufted: each atom has a single vertex, shared by faces, wire triangles and tetrahedra.
+
+## Wire triangles
+
+A wire is a SINGULAR edge of the alpha complex, an edge that no facet of the complex contains. It carries a neck of the solvent-accessible surface: the circle of radius rho where the two balls of radius r + probe_radius meet. Wires that link two connected components of the face mesh are kept:
+
+- directly, when both ends lie on faces of different components;
+- through a chain, when the wire touches a lone atom (on no face) and its cluster of lone atoms, joined by wires, reaches two or more components. Wires ending at a lone atom that has no other wire are removed first, repeatedly.
+
+Each kept wire (u, v) becomes the triangle (u, v, apex), with
+
+```
+apex = (u + v) / 2 + rho * normalize(cross(v - u, helper))
+```
+
+where `helper` is the x axis, or the y axis when `|(v - u).x| >= 0.9 |v - u|`.
 
 ## License
 Provided as-is. Check CGAL's licensing requirements if using in a commercial application.

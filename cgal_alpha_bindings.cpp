@@ -60,9 +60,8 @@ static EdgeKey make_edge_key(Vertex_handle u, Vertex_handle v) {
     return (u < v) ? EdgeKey{u, v} : EdgeKey{v, u};
 }
 
-// Apex of the triangle that stands in for a wire (a SINGULAR edge): over the edge
-// midpoint, orthogonal to the edge, at the neck radius rho, the radius of the
-// circle where the two probe-inflated balls (weight = squared radius) meet.
+// Wire triangle apex: rho over the edge midpoint, orthogonal to the edge, with rho
+// the radius of the circle where the two balls meet (weight = squared radius).
 static Point_3 wire_apex(const Weighted_point& a, const Weighted_point& b) {
     Vector_3 d = b.point() - a.point();
     double len2 = d.squared_length();
@@ -100,7 +99,7 @@ extract_mesh_from_alpha_shape(Fixed_alpha_shape& A,
             add_facet(*fit);
     }
 
-    // Triangle components: face vertices joined by face edges.
+    // Connected components of the face mesh.
     std::map<Vertex_handle, Vertex_handle> parent;
     for (auto v : used_vertices)
         parent[v] = v;
@@ -114,17 +113,71 @@ extract_mesh_from_alpha_shape(Fixed_alpha_shape& A,
     for (auto& e : face_edges)
         parent[find(e.first)] = find(e.second);
 
-    // Each linking singular edge, whose ends lie on triangles of two different
-    // components, becomes the triangle (u, v, apex), the apex a new vertex.
+    // Keep the singular edges (wires) that link two components, directly or through
+    // a chain of wires over lone vertices (on no face).
+    auto lone = [&](Vertex_handle v) { return used_vertices.count(v) == 0; };
     std::vector<std::array<Vertex_handle, 2>> wires;
+    std::vector<std::array<Vertex_handle, 2>> chain_wires;
+    // Chain wire ends, a face vertex replaced by its component root.
+    std::vector<std::array<Vertex_handle, 2>> chain_nodes;
     for (auto eit = A.finite_edges_begin(); eit != A.finite_edges_end(); ++eit) {
         if (A.classify(*eit) != Fixed_alpha_shape::SINGULAR)
             continue;
 
         auto u = eit->first->vertex(eit->second);
         auto v = eit->first->vertex(eit->third);
-        if (parent.count(u) && parent.count(v) && find(u) != find(v))
-            wires.push_back({u, v});
+        if (!lone(u) && !lone(v)) {
+            if (find(u) != find(v))
+                wires.push_back({u, v});
+        } else {
+            chain_wires.push_back({u, v});
+            chain_nodes.push_back({lone(u) ? u : find(u), lone(v) ? v : find(v)});
+        }
+    }
+
+    // Strip dead ends: a lone vertex with a single chain wire.
+    std::vector<bool> alive(chain_nodes.size(), true);
+    for (bool stripped = true; stripped;) {
+        stripped = false;
+        std::map<Vertex_handle, int> degree;
+        for (size_t i = 0; i < chain_nodes.size(); i++)
+            if (alive[i]) {
+                degree[chain_nodes[i][0]]++;
+                degree[chain_nodes[i][1]]++;
+            }
+        for (size_t i = 0; i < chain_nodes.size(); i++) {
+            auto& n = chain_nodes[i];
+            if (alive[i] && ((lone(n[0]) && degree[n[0]] == 1) || (lone(n[1]) && degree[n[1]] == 1))) {
+                alive[i] = false;
+                stripped = true;
+            }
+        }
+    }
+
+    // A cluster of lone vertices bridges when its chains reach two components.
+    for (size_t i = 0; i < chain_nodes.size(); i++)
+        if (alive[i])
+            for (auto n : chain_nodes[i])
+                if (lone(n))
+                    parent.emplace(n, n);
+    for (size_t i = 0; i < chain_nodes.size(); i++)
+        if (alive[i] && lone(chain_nodes[i][0]) && lone(chain_nodes[i][1]))
+            parent[find(chain_nodes[i][0])] = find(chain_nodes[i][1]);
+    std::map<Vertex_handle, std::set<Vertex_handle>> reached;
+    for (size_t i = 0; i < chain_nodes.size(); i++) {
+        auto& n = chain_nodes[i];
+        if (alive[i] && lone(n[0]) != lone(n[1]))
+            reached[find(lone(n[0]) ? n[0] : n[1])].insert(lone(n[0]) ? n[1] : n[0]);
+    }
+    for (size_t i = 0; i < chain_nodes.size(); i++) {
+        auto& n = chain_nodes[i];
+        if (alive[i] && reached[find(lone(n[0]) ? n[0] : n[1])].size() >= 2)
+            wires.push_back(chain_wires[i]);
+    }
+
+    for (auto& w : wires) {
+        used_vertices.insert(w[0]);
+        used_vertices.insert(w[1]);
     }
 
     std::map<Vertex_handle, int> vertex_index;
@@ -281,16 +334,15 @@ Args:
     probe_radius: Probe radius to add to atomic radii (default 1.4 for water)
     filter: Filter for facet classification ("all", "solid", "singular+regular")
 
-Each linking SINGULAR edge (u, v), whose ends lie on faces of two different
-connected components of the face mesh, is added as the
-triangle (u, v, apex): the apex is a new vertex at the neck radius rho (radius of
-the circle where the two probe-inflated balls meet) over the edge midpoint, along
-normalize(cross(v - u, helper)), helper = x axis unless the edge is within
-acos(0.9) of it, else y axis.
+Each SINGULAR edge (u, v) that links two connected components of the face mesh,
+directly or through a chain of SINGULAR edges over atoms on no face, is added as
+the triangle (u, v, apex). The apex sits over the edge midpoint at the neck radius
+rho, the radius of the circle where the two probe-inflated balls meet, along
+normalize(cross(v - u, helper)), with helper the x axis, or the y axis when
+|(v - u).x| >= 0.9 |v - u|.
 
 Returns:
-    Tuple of (vertices, faces, tetrahedra, is_apex). Atom vertices come first,
-    then the apex vertices, flagged by the boolean is_apex. Tetrahedra index
-    atom vertices only.
+    Tuple of (vertices, faces, tetrahedra, is_apex). The apex vertices come last
+    and are flagged by is_apex; tetrahedra index atom vertices only.
 )doc");
 }

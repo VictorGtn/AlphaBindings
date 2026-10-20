@@ -37,14 +37,23 @@ probe_radius = 1.4         # Used to expand atomic radii (e.g., solvent probe ra
 filter_type = "singular+regular" 
 
 # Compute the alpha complex
-vertices, faces, tetrahedra = cgal_alpha.compute_alpha_complex_from_atoms(
+vertices, faces, tetrahedra, is_apex = cgal_alpha.compute_alpha_complex_from_atoms(
     positions, radii, alpha_value, probe_radius, filter_type
 )
 
-print(f"Extracted {vertices.shape[0]} vertices")
+print(f"Extracted {vertices.shape[0]} vertices ({is_apex.sum()} wire apexes)")
 print(f"Extracted {faces.shape[0]} faces")
 print(f"Extracted {tetrahedra.shape[0]} interior tetrahedra")
 ```
+
+## Output
+
+- `vertices` (N, 3) float32: one vertex per atom on a face or tetrahedron, then one apex vertex per wire triangle.
+- `faces` (M, 3) int32: the facets whose classification passes `filter`, then the wire triangles.
+- `tetrahedra` (K, 4) int32: the INTERIOR cells, indexing atom vertices.
+- `is_apex` (N,) bool: true for the apex vertices, which are always the last ones.
+
+A linking wire is a SINGULAR edge whose two ends lie on faces of two different connected components of the face mesh. Each one becomes the triangle (u, v, apex), with the apex at the neck radius rho over the edge midpoint, rho being the radius of the circle where the two probe-inflated balls (radius r + probe_radius) meet. The apex direction is `normalize(cross(v - u, helper))`, with `helper` the x axis unless `|(v - u).x| >= 0.9 |v - u|`, in which case it is the y axis.
 
 ## License
 Provided as-is. Check CGAL's licensing requirements if using in a commercial application.

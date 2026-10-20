@@ -17,6 +17,8 @@
 #include <map>
 #include <string>
 #include <stdexcept>
+#include <algorithm>
+#include <cmath>
 
 namespace py = pybind11;
 
@@ -31,6 +33,7 @@ typedef CGAL::Fixed_alpha_shape_3<Triangulation> Fixed_alpha_shape;
 
 typedef Triangulation::Weighted_point Weighted_point;
 typedef Triangulation::Bare_point Point_3;
+typedef K::Vector_3 Vector_3;
 
 std::set<Fixed_alpha_shape::Classification_type> parse_filter(const std::string& filter_str) {
     std::set<Fixed_alpha_shape::Classification_type> allowed;
@@ -57,11 +60,24 @@ static EdgeKey make_edge_key(Vertex_handle u, Vertex_handle v) {
     return (u < v) ? EdgeKey{u, v} : EdgeKey{v, u};
 }
 
-std::tuple<py::array_t<float>, py::array_t<int32_t>, py::array_t<int32_t>>
+// Apex of the triangle that stands in for a wire (a SINGULAR edge): over the edge
+// midpoint, orthogonal to the edge, at the neck radius rho, the radius of the
+// circle where the two probe-inflated balls (weight = squared radius) meet.
+static Point_3 wire_apex(const Weighted_point& a, const Weighted_point& b) {
+    Vector_3 d = b.point() - a.point();
+    double len2 = d.squared_length();
+    double len = std::sqrt(len2);
+    double d_a = (len2 + a.weight() - b.weight()) / (2 * len);
+    double rho = std::sqrt(std::max(a.weight() - d_a * d_a, 0.0));
+    Vector_3 helper = std::abs(d.x()) < 0.9 * len ? Vector_3(1, 0, 0) : Vector_3(0, 1, 0);
+    Vector_3 n = CGAL::cross_product(d, helper);
+    n = n / std::sqrt(n.squared_length());
+    return CGAL::midpoint(a.point(), b.point()) + rho * n;
+}
+
+std::tuple<py::array_t<float>, py::array_t<int32_t>, py::array_t<int32_t>, py::array_t<bool>>
 extract_mesh_from_alpha_shape(Fixed_alpha_shape& A,
                                const std::set<Fixed_alpha_shape::Classification_type>& allowed) {
-    K::Compute_squared_radius_smallest_orthogonal_sphere_3 sq_radius_ortho;
-
     std::set<Vertex_handle> used_vertices;
     std::vector<std::array<Vertex_handle, 3>> face_vertex_handles;
     std::set<EdgeKey> face_edges;
@@ -84,41 +100,31 @@ extract_mesh_from_alpha_shape(Fixed_alpha_shape& A,
             add_facet(*fit);
     }
 
-    // Repair singular edges by adding the cheapest incident Delaunay facet.
+    // Triangle components: face vertices joined by face edges.
+    std::map<Vertex_handle, Vertex_handle> parent;
+    for (auto v : used_vertices)
+        parent[v] = v;
+    auto find = [&](Vertex_handle v) {
+        while (parent[v] != v) {
+            parent[v] = parent[parent[v]];
+            v = parent[v];
+        }
+        return v;
+    };
+    for (auto& e : face_edges)
+        parent[find(e.first)] = find(e.second);
+
+    // Each linking singular edge, whose ends lie on triangles of two different
+    // components, becomes the triangle (u, v, apex), the apex a new vertex.
+    std::vector<std::array<Vertex_handle, 2>> wires;
     for (auto eit = A.finite_edges_begin(); eit != A.finite_edges_end(); ++eit) {
         if (A.classify(*eit) != Fixed_alpha_shape::SINGULAR)
             continue;
 
         auto u = eit->first->vertex(eit->second);
         auto v = eit->first->vertex(eit->third);
-        if (face_edges.count(make_edge_key(u, v)))
-            continue;
-
-        double best_mu = std::numeric_limits<double>::max();
-        std::optional<Facet> best_facet;
-
-        auto fcirc = A.incident_facets(*eit);
-        auto fdone = fcirc;
-        do {
-            Facet f = *fcirc;
-            if (!A.is_infinite(f)) {
-                auto cell = f.first;
-                int opp = f.second;
-                std::array<Weighted_point, 3> wpts;
-                int idx = 0;
-                for (int i = 0; i < 4; i++)
-                    if (i != opp) wpts[idx++] = cell->vertex(i)->point();
-                double mu = CGAL::to_double(sq_radius_ortho(wpts[0], wpts[1], wpts[2]));
-                if (mu < best_mu) {
-                    best_mu = mu;
-                    best_facet = f;
-                }
-            }
-            ++fcirc;
-        } while (fcirc != fdone);
-
-        if (best_facet)
-            add_facet(*best_facet);
+        if (parent.count(u) && parent.count(v) && find(u) != find(v))
+            wires.push_back({u, v});
     }
 
     std::map<Vertex_handle, int> vertex_index;
@@ -144,30 +150,48 @@ extract_mesh_from_alpha_shape(Fixed_alpha_shape& A,
         tetrahedra.push_back(tet);
     }
     
-    size_t num_vertices = vertices.size();
-    size_t num_faces = face_vertex_handles.size();
+    size_t num_atom_vertices = vertices.size();
+    size_t num_wires = wires.size();
+    size_t num_vertices = num_atom_vertices + num_wires;
+    size_t num_facets = face_vertex_handles.size();
+    size_t num_faces = num_facets + num_wires;
     size_t num_tets = tetrahedra.size();
 
     py::array_t<float> vertices_array({num_vertices, size_t(3)});
     py::array_t<int32_t> faces_array({num_faces, size_t(3)});
     py::array_t<int32_t> tets_array({num_tets, size_t(4)});
+    py::array_t<bool> apex_array(num_vertices);
 
     auto v_buf = vertices_array.mutable_unchecked<2>();
     auto f_buf = faces_array.mutable_unchecked<2>();
     auto t_buf = tets_array.mutable_unchecked<2>();
+    auto a_buf = apex_array.mutable_unchecked<1>();
 
-    for (size_t i = 0; i < num_vertices; i++) {
+    for (size_t i = 0; i < num_atom_vertices; i++) {
         auto p = vertices[i]->point().point();
         v_buf(i, 0) = static_cast<float>(p.x());
         v_buf(i, 1) = static_cast<float>(p.y());
         v_buf(i, 2) = static_cast<float>(p.z());
+        a_buf(i) = false;
     }
 
-    for (size_t i = 0; i < num_faces; i++) {
+    for (size_t i = 0; i < num_facets; i++) {
         auto& vh = face_vertex_handles[i];
         f_buf(i, 0) = vertex_index[vh[0]];
         f_buf(i, 1) = vertex_index[vh[1]];
         f_buf(i, 2) = vertex_index[vh[2]];
+    }
+
+    for (size_t i = 0; i < num_wires; i++) {
+        size_t apex = num_atom_vertices + i;
+        auto p = wire_apex(wires[i][0]->point(), wires[i][1]->point());
+        v_buf(apex, 0) = static_cast<float>(p.x());
+        v_buf(apex, 1) = static_cast<float>(p.y());
+        v_buf(apex, 2) = static_cast<float>(p.z());
+        a_buf(apex) = true;
+        f_buf(num_facets + i, 0) = vertex_index[wires[i][0]];
+        f_buf(num_facets + i, 1) = vertex_index[wires[i][1]];
+        f_buf(num_facets + i, 2) = static_cast<int32_t>(apex);
     }
 
     for (size_t i = 0; i < num_tets; i++) {
@@ -177,10 +201,10 @@ extract_mesh_from_alpha_shape(Fixed_alpha_shape& A,
         t_buf(i, 3) = tetrahedra[i][3];
     }
 
-    return std::make_tuple(vertices_array, faces_array, tets_array);
+    return std::make_tuple(vertices_array, faces_array, tets_array, apex_array);
 }
 
-std::tuple<py::array_t<float>, py::array_t<int32_t>, py::array_t<int32_t>>
+std::tuple<py::array_t<float>, py::array_t<int32_t>, py::array_t<int32_t>, py::array_t<bool>>
 compute_alpha_complex_from_atoms(
     py::array_t<float> positions,
     py::array_t<float> radii,
@@ -239,7 +263,7 @@ compute_alpha_complex_from_atoms(
 
 PYBIND11_MODULE(cgal_alpha, m) {
     m.doc() = "Fast Alpha Complex Python bindings using CGAL Fixed_alpha_shape_3";
-    m.attr("__version__") = "1.1.0-error-handling";
+    m.attr("__version__") = "1.2.0-wire-triangles";
 
     m.def("compute_alpha_complex_from_atoms", &compute_alpha_complex_from_atoms,
           py::arg("positions"),
@@ -257,7 +281,16 @@ Args:
     probe_radius: Probe radius to add to atomic radii (default 1.4 for water)
     filter: Filter for facet classification ("all", "solid", "singular+regular")
 
+Each linking SINGULAR edge (u, v), whose ends lie on faces of two different
+connected components of the face mesh, is added as the
+triangle (u, v, apex): the apex is a new vertex at the neck radius rho (radius of
+the circle where the two probe-inflated balls meet) over the edge midpoint, along
+normalize(cross(v - u, helper)), helper = x axis unless the edge is within
+acos(0.9) of it, else y axis.
+
 Returns:
-    Tuple of (vertices, faces, tetrahedra)
+    Tuple of (vertices, faces, tetrahedra, is_apex). Atom vertices come first,
+    then the apex vertices, flagged by the boolean is_apex. Tetrahedra index
+    atom vertices only.
 )doc");
 }
